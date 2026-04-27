@@ -13,7 +13,10 @@ When the default output device name contains `AirPods`, the app saves that devic
 
 The saved value is stored locally in `UserDefaults`. Nothing leaves your Mac, this is a fully offline app.
 
-## Requirements To Build
+## How to Download And Install
+Download the file ```AirpodVolumeMacApp.app.zip``` from the Releases section to get the latest version of the compiled app. Unzip and open the ```AirpodVolumeMacApp.app``` to run, and follow the instructions in the "To Set Start At Login" section below to allow the app to open automatically on boot. Alternatively, if you want to build the compiled binary for the app yourself, follow the instructions below:
+
+## Requirements To Build 
 
 - Apple Silicon Mac.
 - macOS 13+.
