@@ -1,6 +1,6 @@
 # AirPods Volume Memory
 
-A tiny native macOS menu-bar app for Apple Silicon Macs to fix the annoying bug where each time you connect your airpods, the volume resets to 50%. It watches the current output audio device, remembers the volume you set for AirPods, and restores that volume the next time those AirPods become the active output device.
+A tiny native macOS menu-bar app for Apple Silicon Macs to fix the annoying bug where each time you connect your airpods, the volume resets to 50%. It watches the current output audio device, remembers the volume you set for AirPods, and restores that volume the next time those AirPods become the active output device. This bug was super annoying to me, hope this app helps you if it annoyed you as well lol.
 
 ## How It Works
 
