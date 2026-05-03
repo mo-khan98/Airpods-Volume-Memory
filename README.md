@@ -1,6 +1,6 @@
 # AirPods Volume Memory
 
-A tiny native macOS menu-bar app for Apple Silicon Macs to fix the annoying bug where each time you connect your airpods, the volume resets to 50%. It watches the current output audio device, remembers the volume you set for AirPods, and restores that volume the next time those AirPods become the active output device.
+A tiny native macOS menu-bar app for Apple Silicon Macs to fix the annoying bug where each time you connect your airpods, the volume resets to 50%. It watches the current output audio device, remembers the volume you set for AirPods, and restores that volume the next time those AirPods become the active output device. This bug was super annoying to me, hope this app helps you if it annoyed you as well lol.
 
 ## How It Works
 
@@ -13,7 +13,10 @@ When the default output device name contains `AirPods`, the app saves that devic
 
 The saved value is stored locally in `UserDefaults`. Nothing leaves your Mac, this is a fully offline app.
 
-## Requirements To Build
+## How to Download And Install
+Download the file ```AirpodVolumeMacApp.app.zip``` from the Releases section to get the latest version of the compiled app. Unzip and open the ```AirpodVolumeMacApp.app``` to run, and follow the instructions in the "To Set Start At Login" section below to allow the app to open automatically on boot. Alternatively, if you want to build the compiled binary for the app yourself, follow the instructions below:
+
+## Requirements To Build 
 
 - Apple Silicon Mac.
 - macOS 13+.
