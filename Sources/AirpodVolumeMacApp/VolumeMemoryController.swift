@@ -273,21 +273,20 @@ final class VolumeMemoryController {
     }
 
     private func saveChangedVolumeIfNeeded() {
-        guard Date() >= suppressSavingUntil else {
-            return
-        }
-
-        guard Date() >= automaticSavingEnabledAt else {
-            return
-        }
-
         guard let device = currentDevice, device.isAirPods else {
             return
         }
 
         do {
             let volume = normalizedVolume(try AudioHardware.outputVolume(for: device))
+            let canSaveAutomatically = Date() >= suppressSavingUntil && Date() >= automaticSavingEnabledAt
+            guard canSaveAutomatically else {
+                publishObservedVolumeStatus(for: device, currentVolume: volume)
+                return
+            }
+
             if let savedVolume = savedVolume(for: device), abs(savedVolume - volume) < 0.0001 {
+                publishTrackingStatus(for: device, currentVolume: volume, note: "AirPods volume is unchanged.")
                 return
             }
 
@@ -302,6 +301,16 @@ final class VolumeMemoryController {
                 canAdjustVolume: true
             )
         }
+    }
+
+    private func publishObservedVolumeStatus(for device: AudioDevice, currentVolume: Float) {
+        publish(
+            menuBarTitle: "AirPods \(percent(currentVolume))",
+            primary: "Current \(device.name) volume: \(percent(currentVolume)).",
+            secondary: "Use Save Current Volume Now to remember this level.",
+            currentVolume: currentVolume,
+            canAdjustVolume: true
+        )
     }
 
     private func publishTrackingStatus(for device: AudioDevice, currentVolume: Float, note: String) {
