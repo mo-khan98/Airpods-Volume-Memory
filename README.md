@@ -9,7 +9,7 @@ macOS exposes audio devices through CoreAudio. This app listens for two things:
 1. The default output device changes.
 2. The active AirPods output volume changes.
 
-When the default output device name contains `AirPods`, the app saves that device's volume under its CoreAudio device UID. On a later reconnect, it waits briefly for the Bluetooth device to finish becoming available and then restores the saved volume.
+When the default output device name contains `AirPods`, the app saves that device's volume under its CoreAudio device UID. On a later reconnect, it waits briefly for the Bluetooth device to finish becoming available and then restores the saved volume. Reconnect volume changes are ignored for a short settling period so macOS or AirPods default-volume events do not overwrite the remembered value.
 
 The saved value is stored locally in `UserDefaults`. Nothing leaves your Mac, this is a fully offline app.
 
@@ -54,7 +54,7 @@ You should see `AirPods Vol` in the macOS menu bar. There is no Dock icon becaus
 
 When the AirPods reconnect as the active output, the menu-bar title should update and the app should restore the remembered volume.
 
-The slider is enabled only when AirPods are the current output device. Moving it sets the AirPods volume immediately and saves that value for the next reconnect. You can also choose `Save Current Volume Now` if you want to force-save the current AirPods volume.
+The slider is enabled only when AirPods are the current output device. It snaps to the same 16 volume steps as the normal macOS keyboard volume keys. Moving it sets the AirPods volume immediately and saves that value for the next reconnect. You can also choose `Save Current Volume Now` if you want to force-save the current AirPods volume.
 
 ## To Set Start At Login
 
@@ -72,4 +72,5 @@ If you prefer, move `dist/AirpodVolumeMacApp.app` to `/Applications` first and a
 - The app only touches output devices whose name contains `AirPods`.
 - If you renamed your AirPods to a name without `AirPods`, rename them back or adjust `AudioDevice.isAirPods` in `Sources/AirpodVolumeMacApp/AudioDevice.swift`.
 - Some devices expose a single master volume, while others expose left and right channels. The app supports both.
+- After AirPods reconnect, automatic saving is paused briefly. This prevents macOS's reconnect/default volume from replacing your remembered volume. Use `Save Current Volume Now` if you intentionally change the volume during that settling period and want to save it immediately.
 

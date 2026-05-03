@@ -52,6 +52,8 @@ final class StatusBarController: NSObject {
         volumeSlider.target = self
         volumeSlider.action = #selector(volumeSliderChanged)
         volumeSlider.isContinuous = true
+        volumeSlider.numberOfTickMarks = 17
+        volumeSlider.allowsTickMarkValuesOnly = true
 
         let saveNowItem = NSMenuItem(
             title: "Save Current Volume Now",

@@ -15,6 +15,8 @@ final class VolumeMemoryController {
     private let savedVolumeKeyPrefix = "savedOutputVolume."
     private let restoreDelay: TimeInterval = 1.0
     private let saveDebounceDelay: TimeInterval = 0.2
+    private let reconnectAutoSaveDelay: TimeInterval = 120
+    private let keyboardVolumeSteps: Float = 16
 
     private var defaultOutputListener: AudioPropertyListener?
     private var volumeListener: AudioPropertyListener?
@@ -22,6 +24,7 @@ final class VolumeMemoryController {
     private var pendingRestoreWorkItem: DispatchWorkItem?
     private var pendingSaveWorkItem: DispatchWorkItem?
     private var suppressSavingUntil = Date.distantPast
+    private var automaticSavingEnabledAt = Date.distantPast
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -77,7 +80,7 @@ final class VolumeMemoryController {
                 return
             }
 
-            let volume = try AudioHardware.outputVolume(for: device)
+            let volume = normalizedVolume(try AudioHardware.outputVolume(for: device))
             save(volume, for: device)
             publishTrackingStatus(for: device, currentVolume: volume, note: "Saved current AirPods volume.")
         } catch {
@@ -119,10 +122,11 @@ final class VolumeMemoryController {
                 return
             }
 
-            let clampedVolume = min(max(volume, 0), 1)
+            let clampedVolume = normalizedVolume(volume)
             try AudioHardware.setOutputVolume(clampedVolume, for: device)
             save(clampedVolume, for: device)
             suppressSaves(for: 0.5)
+            automaticSavingEnabledAt = Date()
             publishTrackingStatus(for: device, currentVolume: clampedVolume, note: "Set and saved AirPods volume.")
         } catch {
             publish(
@@ -144,6 +148,7 @@ final class VolumeMemoryController {
         do {
             guard let device = try AudioHardware.defaultOutputDevice() else {
                 currentDevice = nil
+                automaticSavingEnabledAt = Date.distantPast
                 publish(
                     menuBarTitle: "AirPods Vol",
                     primary: "No output device is active.",
@@ -157,6 +162,7 @@ final class VolumeMemoryController {
             currentDevice = device
 
             guard device.isAirPods else {
+                automaticSavingEnabledAt = Date.distantPast
                 publish(
                     menuBarTitle: "AirPods Vol",
                     primary: "Current output: \(device.name)",
@@ -168,26 +174,30 @@ final class VolumeMemoryController {
             }
 
             installVolumeListener(for: device)
-            let currentVolume = try? AudioHardware.outputVolume(for: device)
+            let currentVolume = (try? AudioHardware.outputVolume(for: device)).map(normalizedVolume)
 
             if let savedVolume = savedVolume(for: device) {
-                suppressSaves(for: restoreDelay + 1.5)
+                let rememberedVolume = normalizedVolume(savedVolume)
+                suppressSaves(for: restoreDelay + reconnectAutoSaveDelay)
+                automaticSavingEnabledAt = Date().addingTimeInterval(restoreDelay + reconnectAutoSaveDelay)
                 publish(
-                    menuBarTitle: "AirPods \(percent(savedVolume))",
-                    primary: "Restoring \(device.name) to \(percent(savedVolume)).",
+                    menuBarTitle: "AirPods \(percent(rememberedVolume))",
+                    primary: "Restoring \(device.name) to \(percent(rememberedVolume)).",
                     secondary: currentVolume.map { "Current system volume is \(percent($0))." } ?? "Waiting for volume controls.",
-                    currentVolume: currentVolume ?? savedVolume,
+                    currentVolume: currentVolume ?? rememberedVolume,
                     canAdjustVolume: true
                 )
-                scheduleRestore(savedVolume, for: device)
+                scheduleRestore(rememberedVolume, for: device)
             } else if let currentVolume {
                 save(currentVolume, for: device)
+                automaticSavingEnabledAt = Date().addingTimeInterval(reconnectAutoSaveDelay)
                 publishTrackingStatus(
                     for: device,
                     currentVolume: currentVolume,
                     note: "Saved this as the first remembered volume."
                 )
             } else {
+                automaticSavingEnabledAt = Date().addingTimeInterval(reconnectAutoSaveDelay)
                 publish(
                     menuBarTitle: "AirPods Vol",
                     primary: "Tracking \(device.name).",
@@ -238,8 +248,9 @@ final class VolumeMemoryController {
         }
 
         do {
-            try AudioHardware.setOutputVolume(volume, for: device)
-            publishTrackingStatus(for: device, currentVolume: volume, note: "Restored saved volume.")
+            let restoredVolume = normalizedVolume(volume)
+            try AudioHardware.setOutputVolume(restoredVolume, for: device)
+            publishTrackingStatus(for: device, currentVolume: restoredVolume, note: "Restored saved volume.")
         } catch {
             publish(
                 menuBarTitle: "AirPods Vol",
@@ -266,12 +277,20 @@ final class VolumeMemoryController {
             return
         }
 
+        guard Date() >= automaticSavingEnabledAt else {
+            return
+        }
+
         guard let device = currentDevice, device.isAirPods else {
             return
         }
 
         do {
-            let volume = try AudioHardware.outputVolume(for: device)
+            let volume = normalizedVolume(try AudioHardware.outputVolume(for: device))
+            if let savedVolume = savedVolume(for: device), abs(savedVolume - volume) < 0.0001 {
+                return
+            }
+
             save(volume, for: device)
             publishTrackingStatus(for: device, currentVolume: volume, note: "Saved new AirPods volume.")
         } catch {
@@ -301,7 +320,7 @@ final class VolumeMemoryController {
     }
 
     private func save(_ volume: Float, for device: AudioDevice) {
-        defaults.set(Double(min(max(volume, 0), 1)), forKey: savedVolumeKey(for: device))
+        defaults.set(Double(normalizedVolume(volume)), forKey: savedVolumeKey(for: device))
     }
 
     private func savedVolume(for device: AudioDevice) -> Float? {
@@ -310,7 +329,7 @@ final class VolumeMemoryController {
             return nil
         }
 
-        return Float(defaults.double(forKey: key))
+        return normalizedVolume(Float(defaults.double(forKey: key)))
     }
 
     private func savedVolumeKey(for device: AudioDevice) -> String {
@@ -336,6 +355,11 @@ final class VolumeMemoryController {
     }
 
     private func percent(_ volume: Float) -> String {
-        "\(Int((min(max(volume, 0), 1) * 100).rounded()))%"
+        "\(Int((normalizedVolume(volume) * 100).rounded()))%"
+    }
+
+    private func normalizedVolume(_ volume: Float) -> Float {
+        let clamped = min(max(volume, 0), 1)
+        return (clamped * keyboardVolumeSteps).rounded() / keyboardVolumeSteps
     }
 }
