@@ -12,6 +12,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         statusBarController?.stop()
     }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        statusBarController?.showDeviceManager()
+        return true
+    }
 }
 
 final class StatusBarController: NSObject, NSMenuDelegate {
@@ -31,10 +39,6 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         action: #selector(saveCurrentVolumeNow),
         keyEquivalent: "s"
     )
-    private lazy var forgetVolumeItem = makeMenuItem(
-        title: "Forget Remembered Volume",
-        action: #selector(forgetRememberedVolume)
-    )
     private lazy var automaticRestoreItem = makeMenuItem(
         title: "Restore Automatically",
         action: #selector(toggleAutomaticRestore)
@@ -44,8 +48,28 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         action: #selector(toggleLaunchAtLogin)
     )
     private let controller = VolumeMemoryController()
+    private let preferences = AppPreferences()
+    private let notificationManager = RestoreNotificationManager()
+    private lazy var deviceManagerViewModel = DeviceManagerViewModel(
+        controller: controller,
+        preferences: preferences
+    )
+    private lazy var deviceManagerWindowController = DeviceManagerWindowController(
+        viewModel: deviceManagerViewModel
+    )
+    private lazy var manageDevicesItem = makeMenuItem(
+        title: "Manage AirPods…",
+        action: #selector(showDeviceManager),
+        keyEquivalent: ","
+    )
+    private lazy var resumeRestoresItem = makeMenuItem(
+        title: "Resume Restores",
+        action: #selector(resumeRestores)
+    )
+    private lazy var pauseRestoresItem = makePauseMenuItem()
     private var isRenderingStatus = false
     private var wakeObserver: NSObjectProtocol?
+    private var lastStatus: VolumeMemoryStatus?
 
     override init() {
         super.init()
@@ -56,6 +80,22 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             DispatchQueue.main.async {
                 self?.render(status)
             }
+        }
+        controller.onDataChanged = { [weak self] snapshot in
+            DispatchQueue.main.async {
+                self?.deviceManagerViewModel.receive(snapshot)
+            }
+        }
+        controller.onRestoreNotification = { [weak self] event in
+            guard let self else { return }
+            self.notificationManager.deliver(event, mode: self.preferences.restoreNotificationMode)
+        }
+        preferences.onMenuBarDisplayModeChanged = { [weak self] in
+            guard let self, let status = self.lastStatus else { return }
+            self.renderMenuBar(status)
+        }
+        preferences.onRestoreNotificationModeChanged = { [weak self] mode in
+            self?.notificationManager.modeChanged(mode)
         }
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
@@ -107,9 +147,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(restoreNowItem)
         menu.addItem(saveNowItem)
-        menu.addItem(forgetVolumeItem)
         menu.addItem(.separator())
+        menu.addItem(pauseRestoresItem)
+        menu.addItem(resumeRestoresItem)
         menu.addItem(automaticRestoreItem)
+        menu.addItem(manageDevicesItem)
+        menu.addItem(.separator())
         menu.addItem(launchAtLoginItem)
         menu.addItem(.separator())
         menu.addItem(quitItem)
@@ -117,7 +160,18 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         controller.refresh()
+        deviceManagerViewModel.refreshRuntimeState()
         updateLaunchAtLoginState()
+    }
+
+    private func makePauseMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Pause Restores", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        submenu.addItem(makeMenuItem(title: "For 15 Minutes", action: #selector(pauseFor15Minutes)))
+        submenu.addItem(makeMenuItem(title: "For 1 Hour", action: #selector(pauseForOneHour)))
+        submenu.addItem(makeMenuItem(title: "Until Resumed", action: #selector(pauseUntilResumed)))
+        item.submenu = submenu
+        return item
     }
 
     private func makeVolumeSliderItem() -> NSMenuItem {
@@ -153,8 +207,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private func render(_ status: VolumeMemoryStatus) {
         isRenderingStatus = true
         defer { isRenderingStatus = false }
+        lastStatus = status
 
-        statusItem.button?.title = status.menuBarTitle
+        renderMenuBar(status)
         statusMenuItem.title = status.primaryText
         detailMenuItem.title = status.secondaryText
 
@@ -170,8 +225,39 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         volumeSlider.isEnabled = status.canAdjustVolume
         saveNowItem.isEnabled = status.canAdjustVolume
         restoreNowItem.isEnabled = status.canAdjustVolume && status.hasRememberedVolume
-        forgetVolumeItem.isEnabled = status.canAdjustVolume && status.hasRememberedVolume
         automaticRestoreItem.state = status.automaticRestoreEnabled ? .on : .off
+        pauseRestoresItem.isHidden = status.restoresPaused
+        resumeRestoresItem.isHidden = !status.restoresPaused
+        resumeRestoresItem.title = status.pauseDescription.map { "Resume Restores (paused \($0))" }
+            ?? "Resume Restores"
+        deviceManagerViewModel.refreshRuntimeState()
+    }
+
+    private func renderMenuBar(_ status: VolumeMemoryStatus) {
+        guard let button = statusItem.button else { return }
+        let percent = status.currentVolume.map { Int((min(max($0, 0), 1) * 100).rounded()) }
+        let icon = NSImage(systemSymbolName: "airpodspro", accessibilityDescription: "AirPods Volume")
+        icon?.isTemplate = true
+
+        switch preferences.menuBarDisplayMode {
+        case .iconOnly:
+            button.image = icon
+            button.title = ""
+        case .iconAndPercentage:
+            button.image = icon
+            button.title = percent.map { " \($0)%" } ?? ""
+        case .compactText:
+            button.image = nil
+            button.title = status.menuBarTitle
+        case .deviceName:
+            button.image = nil
+            if let name = status.currentDeviceName, let percent {
+                button.title = "\(name) \(percent)%"
+            } else {
+                button.title = "AirPods Vol"
+            }
+        }
+        button.toolTip = status.primaryText
     }
 
     private func makeMenuItem(
@@ -192,12 +278,28 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         controller.restoreRememberedVolumeNow()
     }
 
-    @objc private func forgetRememberedVolume() {
-        controller.forgetRememberedVolume()
-    }
-
     @objc private func toggleAutomaticRestore() {
         controller.setAutomaticRestoreEnabled(!controller.automaticRestoreEnabled)
+    }
+
+    @objc private func pauseFor15Minutes() {
+        controller.pauseRestores(for: 15 * 60)
+    }
+
+    @objc private func pauseForOneHour() {
+        controller.pauseRestores(for: 60 * 60)
+    }
+
+    @objc private func pauseUntilResumed() {
+        controller.pauseRestores(for: nil)
+    }
+
+    @objc private func resumeRestores() {
+        controller.resumeRestores()
+    }
+
+    @objc func showDeviceManager() {
+        deviceManagerWindowController.show()
     }
 
     @objc private func toggleLaunchAtLogin() {

@@ -13,7 +13,12 @@ The app is fully offline. Remembered values and preferences stay in macOS `UserD
 - Detects normally named AirPods, AirPods identified by their model, and renamed Apple Bluetooth headphones.
 - Watches both master-volume and left/right channel controls.
 - Preserves exact volume values set in Control Center; the menu slider follows the 16 keyboard-volume steps.
-- Includes manual restore, save, forget, automatic-restore, and launch-at-login controls.
+- Provides a Device Manager for changing remembered volumes and restore behavior independently for every pair.
+- Keeps a local, deduplicated history of the latest 100 connections, including the connected and restored volumes.
+- Temporarily pauses restoration for 15 minutes, one hour, or until manually resumed without allowing reconnect noise to overwrite memory.
+- Offers optional failure-only or all-result restore notifications.
+- Supports icon-only, icon-and-percentage, compact text, and full device-name menu-bar styles.
+- Includes manual restore, save, automatic-restore, and launch-at-login controls.
 
 ## Install a release
 
@@ -59,11 +64,22 @@ Menu actions:
 
 - **Restore Remembered Volume** retries the restore sequence immediately.
 - **Save Current Volume** makes the current system value the remembered value.
-- **Forget Remembered Volume** removes the saved value for the active AirPods.
-- **Restore Automatically** pauses or resumes reconnect restoration without quitting the app.
+- **Pause Restores** pauses for 15 minutes, one hour, or until resumed. Manual restore and save remain available.
+- **Restore Automatically** enables or disables restoration globally.
+- **Manage AirPods…** opens the Device Manager, connection history, and preferences. Opening the app again also opens this window.
 - **Launch at Login** registers the app with macOS. A mixed checkmark means approval is still needed under System Settings > General > Login Items.
 
 Moving the app's own slider or choosing **Save Current Volume** cancels any older reconnect attempt, so an intentional change cannot be overwritten by a delayed restore.
+
+## Device Manager
+
+The Device Manager has three tabs:
+
+- **Devices** lists every remembered AirPods UID. Each device has its own remembered-volume slider, automatic-restore switch, connection details, and forget action. Editing an offline device changes only its saved value; editing the connected device applies the new value immediately.
+- **History** shows which AirPods connected, the volume observed at connection, the verified restored volume, and whether restoration succeeded, failed, was paused, or was disabled. History can be cleared without forgetting devices.
+- **Settings** controls global restoration, temporary pause, menu-bar appearance, and restore notifications.
+
+All device records and the latest 100 history entries stay in `UserDefaults`. Existing remembered values from version 0.2 migrate when each device is next seen.
 
 ## Run tests
 
@@ -71,7 +87,7 @@ Moving the app's own slider or choosing **Save Current Volume** cancels any olde
 bash scripts/run-tests.sh
 ```
 
-The test runner has no third-party dependencies and works with the standalone Apple Command Line Tools installation. It covers restore retries and verification, reconnect-noise suppression, cancellation after intentional changes or device switches, reused CoreAudio device IDs, manual behavior while automatic restore is paused, exact-value persistence, and renamed-device detection.
+The test runner has no third-party dependencies and works with the standalone Apple Command Line Tools installation. Its 12 scenarios cover restore retries and verification, reconnect-noise suppression, intentional cancellation, temporary pause/resume, multiple unique devices, connection history and deduplication, preference persistence, reused CoreAudio device IDs, exact-value persistence, and renamed-device detection.
 
 ## Troubleshooting
 

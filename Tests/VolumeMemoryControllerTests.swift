@@ -12,6 +12,10 @@ enum VolumeMemoryControllerTestRunner {
             ("device switch cancels restore", testDeviceSwitchCancelsRestore),
             ("manual restore works while automatic restore is off", testManualRestoreWhenAutomaticRestoreIsOff),
             ("exact volume values are preserved", testExactVolumeValuesArePreserved),
+            ("temporary pause protects memory and can resume", testTemporaryPauseProtectsMemoryAndCanResume),
+            ("multiple devices are managed independently", testMultipleDevicesAreManagedIndependently),
+            ("history records and deduplicates restore results", testHistoryRecordsAndDeduplicatesRestoreResults),
+            ("appearance and notification preferences persist", testPreferencesPersist),
             ("renamed Apple Bluetooth device detection", testRenamedAppleBluetoothDeviceIsRecognized)
         ]
 
@@ -179,12 +183,115 @@ enum VolumeMemoryControllerTestRunner {
                 "initial Control Center volume was quantized"
             )
 
+            scheduler.advance(to: 4.5)
             hardware.volume = 0.427
             hardware.notifyVolumeChanged()
-            scheduler.advance(to: 0.2)
+            scheduler.advance(to: 4.7)
             try expect(
                 abs(defaults.double(forKey: key) - 0.427) < 0.000_001,
                 "changed Control Center volume was quantized"
+            )
+        }
+    }
+
+    private static func testTemporaryPauseProtectsMemoryAndCanResume() throws {
+        try withDefaults { defaults in
+            let device = makeAirPods()
+            let key = "savedOutputVolume.\(device.uid)"
+            defaults.set(0.25, forKey: key)
+            let hardware = FakeAudioHardware(device: device, volume: 0.5)
+            let scheduler = ManualScheduler()
+            let controller = makeController(defaults: defaults, hardware: hardware, scheduler: scheduler)
+
+            controller.pauseRestores(for: 15 * 60)
+            controller.start()
+            hardware.notifyVolumeChanged()
+            scheduler.advance(to: 1)
+
+            try expect(hardware.setVolumes.isEmpty, "a paused connection restored automatically")
+            try expect(defaults.double(forKey: key) == 0.25, "paused reconnect noise overwrote memory")
+            try expect(controller.dataSnapshot().history.first?.outcome == .paused, "paused connection was not recorded")
+
+            controller.resumeRestores()
+            scheduler.advance(to: 2)
+            try expect(hardware.setVolumes == [0.25], "resuming did not restore the current device")
+
+            controller.pauseRestores(for: 0.5)
+            try expect(controller.restoresPaused, "timed pause did not become active")
+            scheduler.advance(to: 2.5)
+            try expect(!controller.restoresPaused, "timed pause did not expire")
+        }
+    }
+
+    private static func testMultipleDevicesAreManagedIndependently() throws {
+        try withDefaults { defaults in
+            let first = makeAirPods()
+            let second = AudioDevice(
+                id: 43,
+                uid: "second-airpods",
+                name: "Travel AirPods",
+                manufacturer: "Apple Inc.",
+                modelUID: "TravelAirPods",
+                transportType: kAudioDeviceTransportTypeBluetooth
+            )
+            let hardware = FakeAudioHardware(device: first, volume: 0.31)
+            let scheduler = ManualScheduler()
+            let controller = makeController(defaults: defaults, hardware: hardware, scheduler: scheduler)
+            controller.start()
+
+            hardware.device = second
+            hardware.volume = 0.62
+            hardware.notifyDefaultOutputChanged()
+
+            var snapshot = controller.dataSnapshot()
+            try expect(snapshot.devices.count == 2, "unique AirPods were not stored separately")
+            try expect(snapshot.history.count == 2, "each unique connection was not recorded")
+
+            controller.updateRememberedVolume(for: first.uid, volume: 0.44)
+            controller.setAutomaticRestore(false, for: first.uid)
+            snapshot = controller.dataSnapshot()
+            let firstRecord = snapshot.devices.first { $0.uid == first.uid }
+            let secondRecord = snapshot.devices.first { $0.uid == second.uid }
+            try expect(abs((firstRecord?.rememberedVolume ?? 0) - 0.44) < 0.000_001, "offline device volume was not updated")
+            try expect(firstRecord?.automaticRestoreEnabled == false, "per-device restore preference was not saved")
+            try expect(abs((secondRecord?.rememberedVolume ?? 0) - 0.62) < 0.000_001, "second device memory was changed")
+            try expect(hardware.setVolumes.isEmpty, "editing an offline device changed the active device")
+        }
+    }
+
+    private static func testHistoryRecordsAndDeduplicatesRestoreResults() throws {
+        try withDefaults { defaults in
+            let device = makeAirPods()
+            defaults.set(0.25, forKey: "savedOutputVolume.\(device.uid)")
+            let hardware = FakeAudioHardware(device: device, volume: 0.5)
+            let scheduler = ManualScheduler()
+            let controller = makeController(defaults: defaults, hardware: hardware, scheduler: scheduler)
+            controller.start()
+            scheduler.advance(to: 4.5)
+
+            var history = controller.dataSnapshot().history
+            try expect(history.count == 1, "initial connection history entry is missing")
+            try expect(history[0].connectedVolume == 0.5, "connected volume was not recorded")
+            try expect(history[0].restoredVolume == 0.25, "restored volume was not recorded")
+            try expect(history[0].outcome == .restored, "successful result was not recorded")
+
+            hardware.notifyDefaultOutputChanged()
+            history = controller.dataSnapshot().history
+            try expect(history.count == 1, "duplicate CoreAudio notifications created duplicate history")
+        }
+    }
+
+    private static func testPreferencesPersist() throws {
+        try withDefaults { defaults in
+            let preferences = AppPreferences(defaults: defaults)
+            preferences.menuBarDisplayMode = .deviceName
+            preferences.restoreNotificationMode = .failuresOnly
+
+            let reloaded = AppPreferences(defaults: defaults)
+            try expect(reloaded.menuBarDisplayMode == .deviceName, "menu-bar display preference was not persisted")
+            try expect(
+                reloaded.restoreNotificationMode == .failuresOnly,
+                "notification preference was not persisted"
             )
         }
     }
