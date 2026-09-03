@@ -22,9 +22,20 @@ The app is fully offline. Remembered values and preferences stay in macOS `UserD
 
 ## Install a release
 
-Download `AirpodVolumeMacApp.app.zip` from the repository's Releases page, unzip it, and move **AirPods Volume** to `/Applications`.
+Download `AirPods-Volume-v2.0.0-arm64.zip` from the repository's Releases page, unzip it, and move **AirPods Volume** to `/Applications`.
 
-The first time you open an independently distributed build, macOS may ask you to confirm that you trust it. Once the app is running, use **Launch at Login** in its menu if you want it to start automatically.
+How to run:
+Since this is not a notarized application, you must grant it permission to run. You can do so as follows:
+- Try opening the app once and dismiss the warning.
+- Open System Settings.
+- Select Privacy & Security.
+- Scroll down to the Security section.
+- Find the message saying AirpodVolumeMacApp was blocked.
+- Click Open Anyway.
+- Authenticate with Touch ID or your Mac password.
+- Click Open in the final confirmation.
+
+Alternatively, you can clone the source code and build it yourself as follows:
 
 ## Build from source
 
