@@ -5,9 +5,23 @@ struct AudioDevice: Equatable {
     let id: AudioDeviceID
     let uid: String
     let name: String
+    let manufacturer: String?
+    let modelUID: String?
+    let transportType: UInt32?
 
     var isAirPods: Bool {
-        name.range(of: "AirPods", options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        [name, modelUID]
+            .compactMap { $0 }
+            .contains { $0.range(of: "AirPods", options: [.caseInsensitive, .diacriticInsensitive]) != nil }
+            || (isBluetooth && manufacturer?.range(
+                of: "Apple",
+                options: [.caseInsensitive, .diacriticInsensitive]
+            ) != nil)
+    }
+
+    var isBluetooth: Bool {
+        transportType == kAudioDeviceTransportTypeBluetooth
+            || transportType == kAudioDeviceTransportTypeBluetoothLE
     }
 }
 
@@ -25,7 +39,11 @@ enum AudioDeviceError: LocalizedError {
     }
 }
 
-final class AudioPropertyListener {
+protocol AudioPropertyListening: AnyObject {
+    func invalidate()
+}
+
+final class AudioPropertyListener: AudioPropertyListening {
     private let objectID: AudioObjectID
     private let queue: DispatchQueue
     private var registrations: [(address: AudioObjectPropertyAddress, block: AudioObjectPropertyListenerBlock)] = []
@@ -38,6 +56,7 @@ final class AudioPropertyListener {
     ) throws {
         self.objectID = objectID
         self.queue = queue
+        var lastFailure: OSStatus?
 
         for originalAddress in addresses {
             var address = originalAddress
@@ -47,11 +66,20 @@ final class AudioPropertyListener {
 
             let status = AudioObjectAddPropertyListenerBlock(objectID, &address, queue, block)
             guard status == noErr else {
-                invalidate()
-                throw AudioDeviceError.osStatus(status, operation: "Add audio property listener")
+                // Some devices advertise both a master control and per-channel controls,
+                // but reject listeners for one of them. Keep every usable registration.
+                lastFailure = status
+                continue
             }
 
             registrations.append((originalAddress, block))
+        }
+
+        if registrations.isEmpty {
+            throw AudioDeviceError.osStatus(
+                lastFailure ?? kAudioHardwareUnspecifiedError,
+                operation: "Add audio property listener"
+            )
         }
     }
 
@@ -183,7 +211,29 @@ enum AudioHardware {
             propertyName: "device UID"
         )
 
-        return AudioDevice(id: deviceID, uid: uid, name: name)
+        return AudioDevice(
+            id: deviceID,
+            uid: uid,
+            name: name,
+            manufacturer: try? stringProperty(
+                kAudioObjectPropertyManufacturer,
+                objectID: AudioObjectID(deviceID),
+                scope: globalScope,
+                propertyName: "device manufacturer"
+            ),
+            modelUID: try? stringProperty(
+                kAudioDevicePropertyModelUID,
+                objectID: AudioObjectID(deviceID),
+                scope: globalScope,
+                propertyName: "device model UID"
+            ),
+            transportType: try? uint32Property(
+                kAudioDevicePropertyTransportType,
+                objectID: AudioObjectID(deviceID),
+                scope: globalScope,
+                propertyName: "device transport type"
+            )
+        )
     }
 
     private static func volumeAddresses(for deviceID: AudioDeviceID) -> [AudioObjectPropertyAddress] {
@@ -283,6 +333,31 @@ enum AudioHardware {
         return value as String
     }
 
+    private static func uint32Property(
+        _ selector: AudioObjectPropertySelector,
+        objectID: AudioObjectID,
+        scope: AudioObjectPropertyScope,
+        propertyName: String
+    ) throws -> UInt32 {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: mainElement
+        )
+        guard hasProperty(objectID: objectID, address: address) else {
+            throw AudioDeviceError.missingProperty(propertyName)
+        }
+
+        var value = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value)
+        guard status == noErr else {
+            throw AudioDeviceError.osStatus(status, operation: "Read \(propertyName)")
+        }
+
+        return value
+    }
+
     private static func volumeAddress(element: AudioObjectPropertyElement) -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyVolumeScalar,
@@ -294,5 +369,38 @@ enum AudioHardware {
     private static func hasProperty(objectID: AudioObjectID, address: AudioObjectPropertyAddress) -> Bool {
         var mutableAddress = address
         return AudioObjectHasProperty(objectID, &mutableAddress)
+    }
+}
+
+protocol AudioHardwareControlling {
+    func defaultOutputDevice() throws -> AudioDevice?
+    func outputVolume(for device: AudioDevice) throws -> Float
+    func setOutputVolume(_ volume: Float, for device: AudioDevice) throws
+    func makeDefaultOutputDeviceListener(handler: @escaping () -> Void) throws -> AudioPropertyListening
+    func makeVolumeListener(for deviceID: AudioDeviceID, handler: @escaping () -> Void) throws -> AudioPropertyListening
+}
+
+struct SystemAudioHardware: AudioHardwareControlling {
+    func defaultOutputDevice() throws -> AudioDevice? {
+        try AudioHardware.defaultOutputDevice()
+    }
+
+    func outputVolume(for device: AudioDevice) throws -> Float {
+        try AudioHardware.outputVolume(for: device)
+    }
+
+    func setOutputVolume(_ volume: Float, for device: AudioDevice) throws {
+        try AudioHardware.setOutputVolume(volume, for: device)
+    }
+
+    func makeDefaultOutputDeviceListener(handler: @escaping () -> Void) throws -> AudioPropertyListening {
+        try AudioHardware.makeDefaultOutputDeviceListener(handler: handler)
+    }
+
+    func makeVolumeListener(
+        for deviceID: AudioDeviceID,
+        handler: @escaping () -> Void
+    ) throws -> AudioPropertyListening {
+        try AudioHardware.makeVolumeListener(for: deviceID, handler: handler)
     }
 }

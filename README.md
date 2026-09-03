@@ -1,79 +1,103 @@
 # AirPods Volume Memory
 
-A tiny native macOS menu-bar app for Apple Silicon Macs to fix the annoying bug where each time you connect your airpods, the volume resets to 50%. It watches the current output audio device, remembers the volume you set for AirPods, and restores that volume the next time those AirPods become the active output device. This bug was super annoying to me, hope this app helps you if it annoyed you as well lol.
+A small, native macOS menu-bar utility that remembers the output volume for each pair of AirPods and restores it when they reconnect. It is intended to work around the macOS/Bluetooth behavior where AirPods occasionally return at an unexpected volume.
 
-## How It Works
+The app is fully offline. Remembered values and preferences stay in macOS `UserDefaults` on your Mac.
 
-macOS exposes audio devices through CoreAudio. This app listens for two things:
+## Highlights
 
-1. The default output device changes.
-2. The active AirPods output volume changes.
+- Remembers a separate volume for each AirPods device using its persistent CoreAudio UID.
+- Applies three bounded restore passes while Bluetooth audio settles, then verifies the result.
+- Ignores temporary reconnect volume changes so they cannot overwrite the remembered value.
+- Rebuilds audio listeners and restores again after the Mac wakes from sleep.
+- Detects normally named AirPods, AirPods identified by their model, and renamed Apple Bluetooth headphones.
+- Watches both master-volume and left/right channel controls.
+- Preserves exact volume values set in Control Center; the menu slider follows the 16 keyboard-volume steps.
+- Provides a Device Manager for changing remembered volumes and restore behavior independently for every pair.
+- Keeps a local, deduplicated history of the latest 100 connections, including the connected and restored volumes.
+- Temporarily pauses restoration for 15 minutes, one hour, or until manually resumed without allowing reconnect noise to overwrite memory.
+- Offers optional failure-only or all-result restore notifications.
+- Supports icon-only, icon-and-percentage, compact text, and full device-name menu-bar styles.
+- Includes manual restore, save, automatic-restore, and launch-at-login controls.
 
-When the default output device name contains `AirPods`, the app saves that device's volume under its CoreAudio device UID. On a later reconnect, it waits briefly for the Bluetooth device to finish becoming available and then restores the saved volume. Reconnect volume changes are ignored for a short settling period so macOS or AirPods default-volume events do not overwrite the remembered value.
+## Install a release
 
-The saved value is stored locally in `UserDefaults`. Nothing leaves your Mac, this is a fully offline app.
+Download `AirpodVolumeMacApp.app.zip` from the repository's Releases page, unzip it, and move **AirPods Volume** to `/Applications`.
 
-## How to Download And Install
-Download the file ```AirpodVolumeMacApp.app.zip``` from the Releases section to get the latest version of the compiled app. Unzip and open the ```AirpodVolumeMacApp.app``` to run, and follow the instructions in the "To Set Start At Login" section below to allow the app to open automatically on boot. Alternatively, if you want to build the compiled binary for the app yourself, follow the instructions below:
+The first time you open an independently distributed build, macOS may ask you to confirm that you trust it. Once the app is running, use **Launch at Login** in its menu if you want it to start automatically.
 
-## Requirements To Build 
+## Build from source
 
-- Apple Silicon Mac.
-- macOS 13+.
-- Swift command-line tools.
+Requirements:
 
-## To Build The App
+- macOS 13 or newer
+- Apple Silicon or Intel Mac
+- Swift command-line tools
 
-From this folder, run:
+Run:
 
 ```sh
-chmod +x scripts/build-app.sh
-scripts/build-app.sh
+bash scripts/build-app.sh
 ```
 
-The app bundle is created at:
+The build script runs the controller tests, creates a release build for the current Mac architecture, packages it, and applies an ad-hoc signature. The result is:
 
 ```text
 dist/AirpodVolumeMacApp.app
 ```
 
-## To Run
-
-Start the app with:
+Open it with:
 
 ```sh
 open dist/AirpodVolumeMacApp.app
 ```
 
-You should see `AirPods Vol` in the macOS menu bar. There is no Dock icon because this is a background menu-bar utility.
+To select a build architecture explicitly, set `AIRPODS_VOLUME_ARCH` to `arm64` or `x86_64`.
 
-## Usage
+## Use
 
-1. Connect your AirPods to the Mac.
-2. Make sure they are the selected output device.
-3. Set the AirPods volume to the level you want remembered, either with macOS controls or with the slider in the app's menu-bar menu.
-4. Leave the app running.
-5. Disconnect and reconnect the AirPods.
+1. Connect the AirPods and select them as the current sound output.
+2. Set the desired level with macOS controls or the app's menu slider.
+3. Leave the menu-bar app running. On the next connection it restores and verifies that level.
 
-When the AirPods reconnect as the active output, the menu-bar title should update and the app should restore the remembered volume.
+Menu actions:
 
-The slider is enabled only when AirPods are the current output device. It snaps to the same 16 volume steps as the normal macOS keyboard volume keys. Moving it sets the AirPods volume immediately and saves that value for the next reconnect. You can also choose `Save Current Volume Now` if you want to force-save the current AirPods volume.
+- **Restore Remembered Volume** retries the restore sequence immediately.
+- **Save Current Volume** makes the current system value the remembered value.
+- **Pause Restores** pauses for 15 minutes, one hour, or until resumed. Manual restore and save remain available.
+- **Restore Automatically** enables or disables restoration globally.
+- **Manage AirPods…** opens the Device Manager, connection history, and preferences. Opening the app again also opens this window.
+- **Launch at Login** registers the app with macOS. A mixed checkmark means approval is still needed under System Settings > General > Login Items.
 
-## To Set Start At Login
+Moving the app's own slider or choosing **Save Current Volume** cancels any older reconnect attempt, so an intentional change cannot be overwritten by a delayed restore.
 
-After building, you can have macOS launch it automatically:
+## Device Manager
 
-1. Open System Settings.
-2. Go to General > Login Items.
-3. Press `+`.
-4. Select `dist/AirpodVolumeMacApp.app`.
+The Device Manager has three tabs:
 
-If you prefer, move `dist/AirpodVolumeMacApp.app` to `/Applications` first and add that copy as the login item.
+- **Devices** lists every remembered AirPods UID. Each device has its own remembered-volume slider, automatic-restore switch, connection details, and forget action. Editing an offline device changes only its saved value; editing the connected device applies the new value immediately.
+- **History** shows which AirPods connected, the volume observed at connection, the verified restored volume, and whether restoration succeeded, failed, was paused, or was disabled. History can be cleared without forgetting devices.
+- **Settings** controls global restoration, temporary pause, menu-bar appearance, and restore notifications.
 
-## Things To Note
+All device records and the latest 100 history entries stay in `UserDefaults`. Existing remembered values from version 0.2 migrate when each device is next seen.
 
-- The app only touches output devices whose name contains `AirPods`.
-- If you renamed your AirPods to a name without `AirPods`, rename them back or adjust `AudioDevice.isAirPods` in `Sources/AirpodVolumeMacApp/AudioDevice.swift`.
-- Some devices expose a single master volume, while others expose left and right channels. The app supports both.
-- After AirPods reconnect, automatic saving is paused briefly. The menu still shows live volume changes, but those changes do not replace your remembered volume until the settling period ends. Use `Save Current Volume Now` if you intentionally change the volume during that settling period and want to save it immediately.
+## Run tests
 
+```sh
+bash scripts/run-tests.sh
+```
+
+The test runner has no third-party dependencies and works with the standalone Apple Command Line Tools installation. Its 12 scenarios cover restore retries and verification, reconnect-noise suppression, intentional cancellation, temporary pause/resume, multiple unique devices, connection history and deduplication, preference persistence, reused CoreAudio device IDs, exact-value persistence, and renamed-device detection.
+
+## Troubleshooting
+
+- If the volume still changes after the menu reports a successful restore, choose **Restore Remembered Volume**. The final menu status will say whether the value was verified or did not stick.
+- If a renamed AirPods device is not detected, verify that CoreAudio reports its manufacturer as Apple. A name or model identifier containing `AirPods` is always accepted.
+- If launch at login shows a mixed checkmark, approve **AirPods Volume** in System Settings > General > Login Items.
+- Only AirPods and Apple-manufactured Bluetooth audio devices are modified. Speakers and unrelated Bluetooth products are ignored.
+
+## How it works
+
+The app listens to CoreAudio's default-output-device property. When a supported Bluetooth output becomes active, it looks up the remembered scalar volume by the device's persistent UID. Restore passes run after 0.75, 2.25, and 5 seconds, followed by a final read-back verification. Volume notifications during that short window update the display but do not replace memory; later user changes are saved after a small debounce.
+
+Both automatic and manual restore sequences are cancelled immediately when the active output changes, the app stops, or the user deliberately sets or saves a new volume.
