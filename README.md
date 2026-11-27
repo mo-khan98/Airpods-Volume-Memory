@@ -1,3 +1,5 @@
+[简体中文说明](README.zh-CN.md) · This fork provides a Simplified Chinese interface.
+
 # AirPods Volume Memory
 
 A small, native macOS menu-bar utility that remembers the output volume for each pair of AirPods and restores it when they reconnect. It is intended to work around the macOS/Bluetooth behavior where AirPods occasionally return at an unexpected volume.
@@ -12,7 +14,7 @@ The app is fully offline. Remembered values and preferences stay in macOS `UserD
 - Rebuilds audio listeners and restores again after the Mac wakes from sleep.
 - Detects normally named AirPods, AirPods identified by their model, and renamed Apple Bluetooth headphones.
 - Watches both master-volume and left/right channel controls.
-- Preserves exact volume values set in Control Center; the menu slider follows the 16 keyboard-volume steps.
+- Preserves exact volume values set in Control Center; the menu slider moves in 1% steps.
 - Provides a Device Manager for changing remembered volumes and restore behavior independently for every pair.
 - Keeps a local, deduplicated history of the latest 100 connections, including the connected and restored volumes.
 - Temporarily pauses restoration for 15 minutes, one hour, or until manually resumed without allowing reconnect noise to overwrite memory.
