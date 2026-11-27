@@ -12,6 +12,9 @@ enum VolumeMemoryControllerTestRunner {
             ("restore retries and verifies", testRestoreUsesMultipleAttemptsAndVerifiesTheResult),
             ("reconnect noise preserves memory", testReconnectNoiseDoesNotOverwriteRememberedVolume),
             ("slider cancels pending restore", testSliderChangeCancelsPendingReconnectRestore),
+            ("handoff reset preserves the slider choice", testHandoffResetsVolumeAfterSliderChange),
+            ("keyboard volume recovers after a handoff reset", testKeyboardHandoffVolume),
+            ("volume rejected while idle is restored when Mac playback resumes", testDeferredVolumeForPlayback),
             ("refresh and reconnect notifications differ", testRefreshAndReconnectNotificationBehavior),
             ("device switch cancels restore", testDeviceSwitchCancelsRestore),
             ("manual restore works while automatic restore is off", testManualRestoreWhenAutomaticRestoreIsOff),
@@ -30,7 +33,9 @@ enum VolumeMemoryControllerTestRunner {
             ("connection notification reports only final failure", testConnectionNotificationCorrection),
             ("notification text leads with the volume", testNotificationText),
             ("takeover blip nudges the player once", testPlaybackStallDetector),
-            ("menu status is plain language", testMenuStatusText)
+            ("menu status is plain language", testMenuStatusText),
+            ("reconnect selects the intended Bluetooth output", testReconnectOutputMatching),
+            ("AirPods handoff correlates the iPhone banner with audio ownership", testAirPodsHandoffOwnership)
         ]
 
         for (name, test) in tests {
@@ -44,6 +49,53 @@ enum VolumeMemoryControllerTestRunner {
         }
 
         print("\n\(tests.count) tests passed")
+    }
+
+    private static func testAirPodsHandoffOwnership() throws {
+        let address = "00:11:22:33:44:55"
+        let otherAddress = "00:11:22:33:44:66"
+        let iPhonePeer = "_shouldAllowRelinquishOwnership _myModel Mac otherTipiName iPhone otherTipiVersion 2.000000"
+        let release = "Setting ownership via BTHAL for Wx \(address) no"
+        let banner = "PostingBanner: Type ReverseRoute, Name AirPods, Addr \(address), PID 0x2027, Timeout 20.000"
+        var state = AirPodsHandoffState()
+
+        state.consume("Setting ownership via BTHAL for Wx \(address) yes", at: 0)
+        try expect(state.owner(for: address) == .mac, "Mac ownership must be recognized without playback")
+        state.consume(iPhonePeer, at: 1)
+        state.consume(release, at: 1.01)
+        try expect(state.owner(for: address) == nil, "discovery or relinquish alone does not confirm the phone")
+        state.consume(banner.replacingOccurrences(of: address, with: otherAddress), at: 1.02)
+        try expect(state.owner(for: otherAddress) == nil, "ignore a banner for another device")
+        state.consume(banner, at: 1.03)
+        state.consume("OwnershipChanged: Received AACP message. Wx \(address) isOwned no", at: 1.09)
+        try expect(state.owner(for: "00-11-22-33-44-55") == .iPhone, "confirm iPhone even when Mac retains Bluetooth")
+        state.consume("OwnershipChanged: Received AACP message. Wx \(address) isOwned yes", at: 3)
+        try expect(state.owner(for: address) == .mac, "Mac recovery overrides the previous phone handoff")
+
+        state.consume(iPhonePeer, at: 4)
+        state.consume(release, at: 4.01)
+        state.consume(banner, at: 6)
+        try expect(state.owner(for: address) == nil, "ignore a stale peer identification")
+        state.consume(iPhonePeer.replacingOccurrences(of: "iPhone", with: "iPad"), at: 7)
+        state.consume(release, at: 7.01)
+        state.consume(banner, at: 7.02)
+        try expect(state.owner(for: address) == nil, "do not label a different peer as iPhone")
+    }
+
+    private static func testReconnectOutputMatching() throws {
+        let headphones = PairedHeadphones(address: "00:11:22:33:44:55", name: "AirPods", allowsNameMatch: true)
+        let duplicate = PairedHeadphones(address: "00:11:22:33:44:55", name: "AirPods", allowsNameMatch: false)
+        func output(
+            _ uid: String, name: String = "AirPods", transport: UInt32 = kAudioDeviceTransportTypeBluetooth
+        ) -> AudioDevice {
+            AudioDevice(id: 1, uid: uid, name: name, manufacturer: nil, modelUID: nil, transportType: transport)
+        }
+
+        try expect(duplicate.matchesOutput(output("00-11-22-33-44-55:output", name: "Renamed")), "address identifies renamed headphones")
+        try expect(!headphones.matchesOutput(output("00-11-22-33-44-66:output")), "same name cannot override a different address")
+        try expect(headphones.matchesOutput(output("opaque UID")), "unique name matches when UID omits the address")
+        try expect(!duplicate.matchesOutput(output("opaque UID")), "ambiguous name is insufficient")
+        try expect(!headphones.matchesOutput(output("opaque UID", transport: kAudioDeviceTransportTypeBuiltIn)), "built-in output is excluded")
     }
 
     private static func testHighVolumeWarning() throws {
@@ -195,6 +247,117 @@ enum VolumeMemoryControllerTestRunner {
 
             try expect(hardware.setVolumes == [0.75], "a stale restore ran after the slider change")
             try expect(defaults.double(forKey: key) == 0.75, "slider value was not remembered")
+        }
+    }
+
+    private static func testHandoffResetsVolumeAfterSliderChange() throws {
+        try withDefaults { defaults in
+            let device = makeAirPods()
+            defaults.set(true, forKey: "fixedRestoreEnabled")
+            defaults.set(15, forKey: "fixedRestorePercent")
+            let hardware = FakeAudioHardware(device: device, volume: 0.15)
+            let scheduler = ManualScheduler()
+            let controller = makeController(defaults: defaults, hardware: hardware, scheduler: scheduler)
+            controller.start()
+
+            controller.setCurrentAirPodsVolume(0.27)
+            hardware.volume = 0.5
+            hardware.notifyDefaultOutputChanged()
+            hardware.notifyVolumeChanged()
+            scheduler.advance(to: 10)
+            try expect(hardware.setVolumes == [0.27, 0.27], "handoff must not overwrite the slider choice")
+            try expect(controller.fixedRestorePercent == 15, "current volume must not change the fixed restore setting")
+
+            controller.setCurrentAirPodsVolume(0.31)
+            hardware.volume = 0.4
+            hardware.notifyVolumeChanged()
+            scheduler.advance(to: 12)
+            try expect(hardware.volume == 0.4, "a different volume change must be honored")
+
+            controller.setCurrentAirPodsVolume(0.36)
+            hardware.device = nil
+            hardware.volume = 0.5
+            hardware.notifyDefaultOutputChanged()
+            scheduler.advance(to: 20)
+            try expect(hardware.setVolumes.last == 0.36, "must not correct another output")
+            try expect(hardware.setVolumes.count == 4, "a disconnected route must receive no verification write")
+        }
+    }
+
+    private static func testKeyboardHandoffVolume() throws {
+        try withDefaults { defaults in
+            let device = makeAirPods()
+            defaults.set(true, forKey: "fixedRestoreEnabled")
+            defaults.set(15, forKey: "fixedRestorePercent")
+            let hardware = FakeAudioHardware(device: device, volume: 0.15)
+            let scheduler = ManualScheduler()
+            let controller = makeController(defaults: defaults, hardware: hardware, scheduler: scheduler)
+            controller.start()
+
+            // The switch can land at 50% before the passive key event arrives.
+            hardware.volume = 0.5
+            controller.handleVolumeKey(increase: true, fine: false)
+            hardware.notifyDefaultOutputChanged()
+            scheduler.advance(to: 8)
+            try expect(hardware.setVolumes == [0.1875], "volume up should use the pre-handoff volume")
+            try expect(controller.fixedRestorePercent == 15, "the key should only change the current volume")
+
+            // Bluetooth and the selected route may both remain unchanged.
+            hardware.volume = 0.5
+            controller.handleVolumeKey(increase: false, fine: false)
+            scheduler.advance(to: 9)
+            try expect(hardware.setVolumes.last == 0.125, "volume down must not jump to 50%")
+
+            hardware.volume = 0.484375
+            controller.handleVolumeKey(increase: true, fine: true)
+            hardware.volume = 0.5
+            scheduler.advance(to: 10)
+            try expect(hardware.setVolumes.count == 2, "a deliberate fine step to 50% should pass through")
+
+            hardware.volume = 0.25
+            controller.handleVolumeKey(increase: false, fine: false)
+            hardware.volume = 0.1875
+            scheduler.advance(to: 11)
+            try expect(hardware.setVolumes.count == 2, "a normal macOS volume change should pass through")
+
+            controller.handleVolumeKey(increase: true, fine: false)
+            controller.handleMuteKey()
+            hardware.volume = 0.5
+            scheduler.advance(to: 12)
+            try expect(hardware.setVolumes.count == 2, "mute should cancel the correction")
+
+            hardware.volume = 0.2
+            controller.handleVolumeKey(increase: true, fine: false)
+            hardware.device = nil
+            hardware.volume = 0.5
+            scheduler.advance(to: 13)
+            try expect(hardware.setVolumes.count == 2, "must not correct a different audio route")
+        }
+    }
+
+    private static func testDeferredVolumeForPlayback() throws {
+        try withDefaults { defaults in
+            let device = makeAirPods()
+            defaults.set(true, forKey: "fixedRestoreEnabled")
+            defaults.set(15, forKey: "fixedRestorePercent")
+            let hardware = FakeAudioHardware(device: device, volume: 0.5)
+            hardware.outputActive = false
+            hardware.ignoresVolumeWrites = true
+            let scheduler = ManualScheduler()
+            let controller = makeController(defaults: defaults, hardware: hardware, scheduler: scheduler)
+            controller.start()
+            scheduler.advance(to: 20)
+            try expect(hardware.volume == 0.5, "fixture must emulate an offline volume control")
+
+            controller.handleVolumeKey(increase: false, fine: false)
+            scheduler.advance(to: 21)
+            try expect(hardware.volume == 0.5, "changing volume while the Mac is idle still fails")
+            hardware.ignoresVolumeWrites = false
+            hardware.outputActive = true
+            hardware.notifyOutputActivityChanged()
+            scheduler.advance(to: 25)
+            try expect(hardware.volume == 0.125, "playback should apply the requested step down from 15%")
+            try expect(controller.fixedRestorePercent == 15, "keep the user's fixed restore setting")
         }
     }
 
@@ -794,6 +957,8 @@ private final class FakeAudioHardware: AudioHardwareControlling {
     var volume: Float
     var setVolumes: [Float] = []
     var ignoresVolumeWrites = false
+    var outputActive: Bool?
+    private var outputActivityHandler: (() -> Void)?
     private var defaultOutputHandler: (() -> Void)?
     private var volumeHandler: (() -> Void)?
 
@@ -823,6 +988,16 @@ private final class FakeAudioHardware: AudioHardwareControlling {
         return FakeListener()
     }
 
+    func isOutputActive(for device: AudioDevice) -> Bool? { outputActive }
+
+    func makeOutputActivityListener(
+        for device: AudioDevice, handler: @escaping () -> Void
+    ) throws -> AudioPropertyListening {
+        outputActivityHandler = handler
+        return FakeListener()
+    }
+
+    func notifyOutputActivityChanged() { outputActivityHandler?() }
     func notifyDefaultOutputChanged() { defaultOutputHandler?() }
     func notifyVolumeChanged() { volumeHandler?() }
 }

@@ -1,4 +1,6 @@
 import AppKit
+import AVFAudio
+import OSLog
 import ServiceManagement
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -33,6 +35,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+private final class ReconnectButton: NSButton {
+    override func draw(_ dirtyRect: NSRect) {
+        let fill: NSColor
+        if !isEnabled {
+            fill = .quaternaryLabelColor
+        } else if cell?.isHighlighted == true {
+            fill = NSColor(srgbRed: 0.10, green: 0.25, blue: 0.63, alpha: 1)
+        } else {
+            fill = NSColor(srgbRed: 0.15, green: 0.34, blue: 0.78, alpha: 1)
+        }
+        fill.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 9, yRadius: 9).fill()
+        super.draw(dirtyRect)
+    }
+}
+
 final class StatusBarController: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
@@ -45,6 +63,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private let preferences = AppPreferences()
     private let notificationManager = RestoreNotificationManager()
     private let stallMonitor = PlaybackStallMonitor()
+    private let volumeKeyMonitor = VolumeKeyMonitor()
+    private let handoffMonitor = AirPodsHandoffMonitor()
+    private var isArbitratingAudioRoute = false
+    private var reconnectOutput: SilentAudioOutput?
+    private let reconnectLogger = Logger(subsystem: "com.akhan.AirpodVolumeMacApp", category: "Reconnect")
+    private lazy var volumeKeyPermissionItem = makeMenuItem(
+        title: "启用键盘音量修复…", action: #selector(enableVolumeKeyFix)
+    )
     private lazy var deviceManagerViewModel = DeviceManagerViewModel(
         controller: controller,
         preferences: preferences,
@@ -58,6 +84,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         action: #selector(showDeviceManager),
         keyEquivalent: ","
     )
+    private let menuWidth: CGFloat = 300
+    private let connectionMessageItem = NSMenuItem()
+    private var connectionRows: [(
+        device: PairedHeadphones, item: NSMenuItem, status: NSTextField, button: ReconnectButton
+    )] = []
+    private var connectionTimer: Timer?
+    private var connectingAddress: String?
+    private var connectionMessage: String?
     private var isRenderingStatus = false
     private var wakeObserver: NSObjectProtocol?
     private var highVolumeWarningGate = HighVolumeWarningGate()
@@ -103,7 +137,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
         preferences.onMenuBarDisplayModeChanged = { [weak self] in
             guard let self, let status = self.lastStatus else { return }
-            self.renderMenuBar(status)
+            self.renderMenuBar(status, volumeOnIPhone: self.volumeOnIPhone)
         }
         preferences.onRestoreNotificationModeChanged = { [weak self] mode in
             self?.notificationManager.modeChanged(mode)
@@ -141,6 +175,20 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
         updateStallMonitor()
         controller.start()
+        volumeKeyMonitor.onAdjustment = { [weak self] increase, fine in
+            self?.controller.handleVolumeKey(increase: increase, fine: fine)
+        }
+        volumeKeyMonitor.onMute = { [weak self] in self?.controller.handleMuteKey() }
+        volumeKeyMonitor.start()
+        handoffMonitor.onChange = { [weak self] in
+            guard let self else { return }
+            self.refreshConnectionRows()
+            if self.volumeOnIPhone, let status = self.lastStatus {
+                self.render(status)
+            }
+            self.controller.refresh()
+        }
+        handoffMonitor.start()
     }
 
     deinit {
@@ -150,6 +198,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     func stop() {
+        connectionTimer?.invalidate()
+        volumeKeyMonitor.stop()
+        handoffMonitor.stop()
+        leaveAudioRouteArbitration()
         stallMonitor.stop()
         controller.stop()
     }
@@ -180,18 +232,240 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(makeHeaderItem())
         menu.addItem(.separator())
+        menu.addItem(connectionMessageItem)
+        menu.addItem(.separator())
+        menu.addItem(volumeKeyPermissionItem)
+        volumeKeyPermissionItem.isHidden = true
         menu.addItem(settingsItem)
         menu.addItem(quitItem)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        handoffMonitor.start()
+        volumeKeyMonitor.start()
+        volumeKeyPermissionItem.isHidden = volumeKeyMonitor.isListening
         controller.refresh()
         deviceManagerViewModel.refreshRuntimeState()
+        rebuildConnectionRows()
+        connectionTimer?.invalidate()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.refreshConnectionRows()
+            self?.controller.refresh()
+        }
+        connectionTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+    }
+
+    @objc private func enableVolumeKeyFix() {
+        if !CGRequestListenEventAccess() {
+            guard let settings = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") else { return }
+            NSWorkspace.shared.open(settings)
+        }
+        volumeKeyMonitor.start()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        connectionTimer?.invalidate()
+        connectionTimer = nil
+    }
+
+    private func rebuildConnectionRows() {
+        for row in connectionRows {
+            menu.removeItem(row.item)
+        }
+        let devices = PairedHeadphones.devices(
+            remembered: controller.dataSnapshot().devices,
+            currentOutput: try? AudioHardware.defaultOutputDevice()
+        )
+        connectionRows = devices.map { device in
+            let name = NSTextField(labelWithString: device.name)
+            name.font = .systemFont(ofSize: 13, weight: .semibold)
+            name.lineBreakMode = .byTruncatingTail
+            name.toolTip = device.name
+
+            let status = NSTextField(labelWithString: "")
+            status.font = .systemFont(ofSize: 12)
+            status.lineBreakMode = .byTruncatingTail
+
+            let button = ReconnectButton(title: "连回 Mac", target: self, action: #selector(reconnectAirPods(_:)))
+            button.isBordered = false
+            button.alignment = .center
+
+            let container = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 95))
+            for view in [name, status, button] {
+                view.translatesAutoresizingMaskIntoConstraints = false
+                container.addSubview(view)
+            }
+            NSLayoutConstraint.activate([
+                name.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+                name.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+                name.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+                status.leadingAnchor.constraint(equalTo: name.leadingAnchor),
+                status.trailingAnchor.constraint(equalTo: name.trailingAnchor),
+                status.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 3),
+                button.leadingAnchor.constraint(equalTo: name.leadingAnchor),
+                button.trailingAnchor.constraint(equalTo: name.trailingAnchor),
+                button.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 6),
+                button.heightAnchor.constraint(equalToConstant: 38)
+            ])
+
+            let item = NSMenuItem()
+            item.view = container
+            menu.insertItem(item, at: menu.index(of: connectionMessageItem))
+            return (device, item, status, button)
+        }
+        refreshConnectionRows()
+    }
+
+    private func refreshConnectionRows() {
+        let output = try? AudioHardware.defaultOutputDevice()
+        for row in connectionRows {
+            let selectedOutput = output.flatMap { row.device.matchesOutput($0) ? $0 : nil }
+            let connected = row.device.isConnected
+            let hasMacAudio = connected && (selectedOutput ?? row.device.audioOutput()).map {
+                AudioHardware.anyProcessOutputting(on: $0.id) == true
+            } == true
+            let owner = handoffMonitor.owner(for: row.device.address)
+            let switchedToIPhone = owner == .iPhone
+            let macOwnsAudio = connected && !switchedToIPhone && (owner == .mac || hasMacAudio)
+            let sourceUnconfirmed = connected && selectedOutput != nil && !macOwnsAudio
+            let connecting = connectingAddress == row.device.address
+            let status: String
+            if connecting {
+                status = "正在连回 Mac…"
+            } else if switchedToIPhone {
+                status = "已切换到 iPhone"
+            } else if macOwnsAudio {
+                status = hasMacAudio ? "检测到 Mac 音频输出" : "Mac 已取得耳机音频控制权"
+            } else if !connected {
+                status = "未连接 Mac · 可能在手机或其他设备上"
+            } else if sourceUnconfirmed {
+                status = "播放设备未确认 · Mac 蓝牙在线"
+            } else {
+                status = "已连 Mac 蓝牙 · 未选为声音输出"
+            }
+            row.status.stringValue = status
+            row.status.textColor = macOwnsAudio ? .systemGreen : .secondaryLabelColor
+
+            let title: String
+            if connecting {
+                title = "正在连接…"
+            } else if switchedToIPhone {
+                title = "连回 Mac"
+            } else if macOwnsAudio {
+                title = "已连接 Mac"
+            } else if sourceUnconfirmed {
+                title = "连回 Mac"
+            } else {
+                title = connected ? "切换到 Mac 输出" : "连回 Mac"
+            }
+            row.button.isEnabled = connectingAddress == nil && !macOwnsAudio
+            row.button.attributedTitle = NSAttributedString(string: title, attributes: [
+                .font: NSFont.systemFont(ofSize: 15, weight: .semibold),
+                .foregroundColor: row.button.isEnabled ? NSColor.white : NSColor.secondaryLabelColor
+            ])
+            row.button.setAccessibilityLabel("\(title)，\(row.device.name)")
+        }
+
+        if connectionRows.isEmpty {
+            connectionMessageItem.title = output?.isAirPods == true
+                ? "AirPods 播放设备未确认"
+                : "未找到已配对的耳机"
+        } else {
+            connectionMessageItem.title = connectionMessage ?? ""
+        }
+        connectionMessageItem.isHidden = !connectionRows.isEmpty && connectionMessage == nil
+    }
+
+    @objc private func reconnectAirPods(_ sender: NSButton) {
+        guard sender.isEnabled, connectingAddress == nil,
+              let device = connectionRows.first(where: { $0.button === sender })?.device else { return }
+        connectingAddress = device.address
+        reconnectLogger.notice("Reconnect requested")
+        connectionMessage = nil
+        refreshConnectionRows()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let connected = device.connect()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if connected {
+                    self.requestAirPodsOutput(device)
+                } else {
+                    self.finishReconnect(message: "连回 Mac 失败，请确认耳机在附近、Mac 蓝牙已打开后重试")
+                }
+            }
+        }
+    }
+
+    private func requestAirPodsOutput(_ device: PairedHeadphones) {
+        let owner = handoffMonitor.owner(for: device.address)
+        let selectedAirPods = (try? AudioHardware.defaultOutputDevice()).map {
+            $0.isAirPods && device.matchesOutput($0)
+        } ?? false
+        if owner == .iPhone || (owner == nil && selectedAirPods) {
+            // The default output can still be a virtual AirPods route owned by the phone.
+            isArbitratingAudioRoute = true
+            AVAudioRoutingArbiter.shared.begin(category: .playback) { [weak self] changedOutput, error in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.connectingAddress == device.address else { return }
+                    self.reconnectLogger.notice("Route arbitration finished, changed output: \(changedOutput), error: \(error != nil)")
+                }
+            }
+        }
+        selectAirPodsOutput(device, attemptsRemaining: 32)
+    }
+
+    private func leaveAudioRouteArbitration() {
+        reconnectOutput = nil
+        guard isArbitratingAudioRoute else { return }
+        isArbitratingAudioRoute = false
+        AVAudioRoutingArbiter.shared.leave()
+    }
+
+    private func selectAirPodsOutput(_ device: PairedHeadphones, attemptsRemaining: Int) {
+        guard connectingAddress == device.address else { return }
+        if !isArbitratingAudioRoute || handoffMonitor.owner(for: device.address) == .mac,
+           device.isConnected, let output = try? AudioHardware.defaultOutputDevice(), device.matchesOutput(output) {
+            finishReconnect(message: nil)
+            return
+        }
+        // The audio output can appear several seconds after Bluetooth connects.
+        guard attemptsRemaining > 0 else {
+            finishReconnect(message: "未能切换声音输出，请在 Mac 的「声音」设置中重试")
+            return
+        }
+        if let output = device.audioOutput() {
+            if (try? AudioHardware.defaultOutputDevice())?.id != output.id {
+                try? AudioHardware.setDefaultOutputDevice(output)
+            }
+            if isArbitratingAudioRoute, reconnectOutput == nil {
+                do {
+                    reconnectOutput = try SilentAudioOutput(device: output)
+                    reconnectLogger.notice("Silent AirPods output started")
+                } catch {
+                    reconnectLogger.error("Silent AirPods output could not start: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.selectAirPodsOutput(device, attemptsRemaining: attemptsRemaining - 1)
+        }
+    }
+
+    private func finishReconnect(message: String?) {
+        reconnectLogger.notice("Reconnect completed, confirmed output: \(message == nil)")
+        leaveAudioRouteArbitration()
+        connectingAddress = nil
+        connectionMessage = message
+        controller.refresh()
+        refreshConnectionRows()
     }
 
     /// Device name, what happens to its volume, and the volume slider in one block.
     private func makeHeaderItem() -> NSMenuItem {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 74))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: menuWidth, height: 74))
         titleLabel.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
         detailLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         detailLabel.textColor = .secondaryLabelColor
@@ -232,29 +506,40 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         return AudioHardware.outputMuted(for: device.id)
     }
 
+    private var volumeOnIPhone: Bool {
+        guard let uid = controller.currentAirPodsUID else { return false }
+        if let address = PairedHeadphones.addressInUID(uid) {
+            return handoffMonitor.owner(for: address) == .iPhone
+        }
+        guard let output = try? AudioHardware.defaultOutputDevice(), output.uid == uid,
+              let row = connectionRows.first(where: { $0.device.matchesOutput(output) }) else { return false }
+        return handoffMonitor.owner(for: row.device.address) == .iPhone
+    }
+
     private func render(_ status: VolumeMemoryStatus) {
         isRenderingStatus = true
         defer { isRenderingStatus = false }
         lastStatus = status
-        let muted = status.canAdjustVolume && outputIsMuted
+        let volumeOnIPhone = self.volumeOnIPhone
+        let muted = !volumeOnIPhone && status.canAdjustVolume && outputIsMuted
         lastMuted = muted
 
         checkHighVolume(status)
-        renderMenuBar(status)
+        renderMenuBar(status, volumeOnIPhone: volumeOnIPhone)
         let lines = MenuStatusText.lines(for: status, muted: muted)
         titleLabel.stringValue = lines.title
-        detailLabel.stringValue = lines.detail
+        detailLabel.stringValue = volumeOnIPhone ? "请在 iPhone 上调节音量" : lines.detail
 
-        if let currentVolume = status.currentVolume {
+        if !volumeOnIPhone, let currentVolume = status.currentVolume {
             let percent = Int((min(max(currentVolume, 0), 1) * 100).rounded())
             volumeSlider.doubleValue = Double(percent)
             volumeValueLabel.stringValue = muted ? "静音" : "\(percent)%"
         } else {
             volumeSlider.doubleValue = 0
-            volumeValueLabel.stringValue = "--"
+            volumeValueLabel.stringValue = "—"
         }
 
-        volumeSlider.isEnabled = status.canAdjustVolume
+        volumeSlider.isEnabled = !volumeOnIPhone && status.canAdjustVolume
         deviceManagerViewModel.refreshRuntimeState()
     }
 
@@ -272,7 +557,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private func checkHighVolume(_ status: VolumeMemoryStatus) {
         // Reconnect volume is often briefly high before the restore lands. Leave the
         // gate untouched; the settled status that follows is checked normally.
-        guard !status.isSettling else { return }
+        guard !status.isSettling, !volumeOnIPhone else { return }
         let uid = status.canAdjustVolume ? controller.currentAirPodsUID : nil
         if highVolumeWarningGate.shouldWarn(
             deviceUID: uid,
@@ -288,10 +573,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    private func renderMenuBar(_ status: VolumeMemoryStatus) {
+    private func renderMenuBar(_ status: VolumeMemoryStatus, volumeOnIPhone: Bool) {
         guard let button = statusItem.button else { return }
-        let muted = lastMuted
-        let percent = status.currentVolume.map { Int((min(max($0, 0), 1) * 100).rounded()) }
+        let muted = !volumeOnIPhone && lastMuted
+        let percent = volumeOnIPhone ? nil : status.currentVolume.map { Int((min(max($0, 0), 1) * 100).rounded()) }
         let icon = menuBarIcon
 
         switch preferences.menuBarDisplayMode {
@@ -303,16 +588,20 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             button.title = muted ? " 静音" : (percent.map { " \($0)%" } ?? "")
         case .compactText:
             button.image = nil
-            button.title = muted && status.canAdjustVolume ? "AirPods 静音" : status.menuBarTitle
+            button.title = volumeOnIPhone ? "AirPods · iPhone"
+                : (muted && status.canAdjustVolume ? "AirPods 静音" : status.menuBarTitle)
         case .deviceName:
             button.image = nil
-            if let name = status.currentDeviceName, let percent {
+            if volumeOnIPhone {
+                button.title = "\(status.currentDeviceName ?? "AirPods") · iPhone"
+            } else if let name = status.currentDeviceName, let percent {
                 button.title = muted ? "\(name) 静音" : "\(name) \(percent)%"
             } else {
                 button.title = "AirPods Vol"
             }
         }
-        button.toolTip = muted ? "当前已静音" : status.primaryText
+        button.toolTip = volumeOnIPhone ? "已切换到 iPhone，请在 iPhone 上调节音量"
+            : (muted ? "当前已静音" : status.primaryText)
     }
 
     private func makeMenuItem(
@@ -330,7 +619,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func volumeSliderChanged() {
-        guard !isRenderingStatus else {
+        guard !isRenderingStatus, !volumeOnIPhone else {
             return
         }
 

@@ -121,10 +121,15 @@ final class VolumeMemoryController {
 
     private var defaultOutputListener: AudioPropertyListening?
     private var volumeListener: AudioPropertyListening?
+    private var outputActivityListener: AudioPropertyListening?
+    private var deferredVolume: (target: Float, automatic: Bool)?
     private var volumeListenerGeneration = UUID()
     private var currentDevice: AudioDevice?
     private var pendingRestoreTasks: [VolumeMemoryScheduledTask] = []
     private var pendingSaveTask: VolumeMemoryScheduledTask?
+    private var pendingManualVolumeVerification: VolumeMemoryScheduledTask?
+    private var pendingKeyboardVolume: Float?
+    private var lastStableVolume: Float?
     private var pendingSettlingTask: VolumeMemoryScheduledTask?
     private var pendingPauseExpirationTask: VolumeMemoryScheduledTask?
     private var restoreTarget: Float?
@@ -180,6 +185,7 @@ final class VolumeMemoryController {
         guard enabled != fixedRestoreEnabled || clamped != fixedRestorePercent else { return }
         defaults.set(enabled, forKey: "fixedRestoreEnabled")
         defaults.set(clamped, forKey: "fixedRestorePercent")
+        cancelManualVolumeVerification()
         // Settings choose the next restore target. Cancel writes already queued for the old target.
         if isRestoreInProgress { cancelRestore() }
         pendingSaveTask?.cancel()
@@ -365,6 +371,7 @@ final class VolumeMemoryController {
     }
 
     func stop() {
+        cancelManualVolumeVerification()
         cancelRestore()
         pendingSettlingTask?.cancel()
         pendingSettlingTask = nil
@@ -376,9 +383,13 @@ final class VolumeMemoryController {
         pendingSaveTask = nil
         defaultOutputListener?.invalidate()
         volumeListener?.invalidate()
+        outputActivityListener?.invalidate()
+        outputActivityListener = nil
+        deferredVolume = nil
         defaultOutputListener = nil
         volumeListener = nil
         currentDevice = nil
+        lastStableVolume = nil
     }
 
     func refresh() {
@@ -475,6 +486,8 @@ final class VolumeMemoryController {
     }
 
     func setCurrentAirPodsVolume(_ volume: Float) {
+        deferredVolume = nil
+        cancelManualVolumeVerification()
         cancelRestore()
         pendingSaveTask?.cancel()
         pendingSaveTask = nil
@@ -488,6 +501,11 @@ final class VolumeMemoryController {
             let clampedVolume = normalizedVolume(volume)
             try audioHardware.setOutputVolume(clampedVolume, for: device)
             if !fixedRestoreEnabled { save(clampedVolume, for: device) }
+            // A handoff can apply the system's 50% default shortly after a slider write.
+            // Verify this explicit choice once, while the same output is still selected.
+            pendingManualVolumeVerification = scheduler.schedule(after: 1.5) { [weak self] in
+                self?.verifyManualVolume(clampedVolume, for: device)
+            }
             publishTrackingStatus(for: device, currentVolume: clampedVolume,
                                   note: fixedRestoreEnabled ? "已调整当前音量。" : "已调整并保存音量。")
         } catch {
@@ -495,9 +513,84 @@ final class VolumeMemoryController {
         }
     }
 
+    func handleVolumeKey(increase: Bool, fine: Bool) {
+        guard let device = try? audioHardware.defaultOutputDevice(), device.isAirPods,
+              let volume = try? audioHardware.outputVolume(for: device) else { return }
+        if !isCurrentEndpoint(device) {
+            reconcileDefaultOutputDevice(force: false)
+        }
+        // The normal key event still goes to macOS. Estimate its step only for
+        // the case where the resulting volume is the erroneous 50%.
+        let handoffVolume = lastStableVolume ?? (
+            isConnectionSettling || isRestoreInProgress ? preferredRestoreVolume(for: device) : nil
+        )
+        let baseline = volumesMatch(volume, 0.5)
+            ? (pendingKeyboardVolume ?? deferredVolume?.target ?? handoffVolume ?? volume) : volume
+        let steps: Float = fine ? 64 : 16
+        let scaled = normalizedVolume(baseline) * steps
+        let nearest = scaled.rounded()
+        let step: Float
+        if abs(nearest - scaled) < 0.001 {
+            step = nearest + (increase ? 1 : -1)
+        } else {
+            step = increase ? ceil(scaled) : floor(scaled)
+        }
+        let target = normalizedVolume(step / steps)
+
+        deferredVolume = nil
+        cancelManualVolumeVerification()
+        cancelRestore()
+        pendingSaveTask?.cancel()
+        pendingSaveTask = nil
+        pendingKeyboardVolume = target
+        pendingManualVolumeVerification = scheduler.schedule(after: 0.35) { [weak self] in
+            self?.verifyManualVolume(target, for: device, fromKeyboard: true)
+        }
+    }
+
+    func handleMuteKey() {
+        if deferredVolume?.automatic == false { deferredVolume = nil }
+        cancelManualVolumeVerification()
+    }
+
+    private func cancelManualVolumeVerification() {
+        pendingManualVolumeVerification?.cancel()
+        pendingManualVolumeVerification = nil
+        pendingKeyboardVolume = nil
+    }
+
+    private func verifyManualVolume(_ target: Float, for device: AudioDevice, fromKeyboard: Bool = false) {
+        pendingManualVolumeVerification = nil
+        pendingKeyboardVolume = nil
+        guard isCurrentEndpoint(device),
+              let active = try? audioHardware.defaultOutputDevice(), sameEndpoint(active, device),
+              let observed = try? audioHardware.outputVolume(for: device) else { return }
+        do {
+            if volumesMatch(observed, 0.5), !volumesMatch(observed, target) {
+                try audioHardware.setOutputVolume(target, for: device)
+            }
+            let current = normalizedVolume(try audioHardware.outputVolume(for: device))
+            if deferVolumeIfWaitingForPlayback(target, observed: current, device: device, automatic: false) {
+                return
+            }
+            if fromKeyboard, !fixedRestoreEnabled,
+               savedVolume(for: device).map({ !volumesMatch($0, current) }) ?? true,
+               !volumesMatch(current, 0.5) || volumesMatch(target, 0.5) {
+                save(current, for: device)
+            }
+            publishTrackingStatus(for: device, currentVolume: current, note: lastTrackingNote)
+        } catch {
+            publishError(primary: "无法保持刚刚设置的 AirPods 音量。", error: error)
+        }
+    }
+
     private func reconcileDefaultOutputDevice(force: Bool) {
         do {
             let device = try audioHardware.defaultOutputDevice()
+            if sameEndpoint(device, currentDevice),
+               pendingManualVolumeVerification != nil || deferredVolume != nil {
+                return
+            }
             if !force, sameEndpoint(device, currentDevice) {
                 if let device {
                     if device.isAirPods {
@@ -526,6 +619,10 @@ final class VolumeMemoryController {
     }
 
     private func outputDeviceChanged(to device: AudioDevice?) {
+        deferredVolume = nil
+        outputActivityListener?.invalidate()
+        outputActivityListener = nil
+        cancelManualVolumeVerification()
         let reusableHistoryEntryID: UUID? = {
             guard sameEndpoint(device, currentDevice),
                   let currentHistoryEntryID,
@@ -545,6 +642,7 @@ final class VolumeMemoryController {
         pendingSaveTask = nil
         volumeListener?.invalidate()
         volumeListener = nil
+        if !sameEndpoint(device, currentDevice) { lastStableVolume = nil }
         currentDevice = device
         currentHistoryEntryID = reusableHistoryEntryID
         if isNewConnection {
@@ -567,6 +665,9 @@ final class VolumeMemoryController {
             connectionNotificationPending = true
         }
         installVolumeListener(for: device)
+        outputActivityListener = try? audioHardware.makeOutputActivityListener(for: device) { [weak self] in
+            self?.outputActivityChanged(for: device)
+        }
         let currentVolume = try? normalizedVolume(audioHardware.outputVolume(for: device))
         let rememberedVolume = preferredRestoreVolume(for: device)
         recordConnection(for: device, connectedVolume: currentVolume)
@@ -609,6 +710,30 @@ final class VolumeMemoryController {
                 canAdjustVolume: true,
                 hasRememberedVolume: false
             )
+        }
+    }
+
+    private func deferVolumeIfWaitingForPlayback(
+        _ target: Float, observed: Float, device: AudioDevice, automatic: Bool
+    ) -> Bool {
+        guard outputActivityListener != nil, audioHardware.isOutputActive(for: device) == false,
+              volumesMatch(observed, 0.5), !volumesMatch(observed, target) else { return false }
+        deferredVolume = (target, automatic)
+        publishTrackingStatus(for: device, currentVolume: observed, note: "等待 Mac 开始播放，再应用调整后的音量。")
+        return true
+    }
+
+    private func outputActivityChanged(for device: AudioDevice) {
+        guard isCurrentEndpoint(device), let pending = deferredVolume,
+              audioHardware.isOutputActive(for: device) == true,
+              let active = try? audioHardware.defaultOutputDevice(), sameEndpoint(active, device) else { return }
+        deferredVolume = nil
+        if pending.automatic {
+            guard automaticRestoreEnabled, !restoresPaused, deviceAutomaticRestoreEnabled(device.uid),
+                  let volume = preferredRestoreVolume(for: device) else { return }
+            beginRestore(volume, for: device, manuallyRequested: false)
+        } else {
+            setCurrentAirPodsVolume(pending.target)
         }
     }
 
@@ -675,6 +800,8 @@ final class VolumeMemoryController {
     }
 
     private func beginRestore(_ volume: Float, for device: AudioDevice, manuallyRequested: Bool) {
+        deferredVolume = nil
+        cancelManualVolumeVerification()
         cancelRestore()
         restoreTarget = normalizedVolume(volume)
         recoveryAttemptsRemaining = 2
@@ -840,6 +967,9 @@ final class VolumeMemoryController {
                     note: "已恢复记忆音量并验证成功。"
                 )
             } else {
+                if !wasManual, deferVolumeIfWaitingForPlayback(target, observed: currentVolume, device: device, automatic: true) {
+                    return
+                }
                 mark(.failed, currentVolume)
                 onRestoreNotification?(
                     RestoreNotificationEvent(
@@ -908,6 +1038,7 @@ final class VolumeMemoryController {
 
         do {
             let volume = normalizedVolume(try audioHardware.outputVolume(for: device))
+            if pendingManualVolumeVerification != nil || deferredVolume != nil, volumesMatch(volume, 0.5) { return }
             guard !isRestoreInProgress, !isConnectionSettling else {
                 publish(
                     primary: "正在稳定：\(device.name) 于 \(percent(restoreTarget ?? volume)).",
@@ -1029,6 +1160,10 @@ final class VolumeMemoryController {
         problem: String? = nil
     ) {
         let airPods = currentDevice?.isAirPods == true ? currentDevice : nil
+        if !isRestoreInProgress, !isConnectionSettling, airPods != nil, let currentVolume,
+           pendingManualVolumeVerification == nil || !volumesMatch(currentVolume, 0.5) {
+            lastStableVolume = currentVolume
+        }
         let title = currentVolume.map { "AirPods \(percent($0))" } ?? "AirPods Vol"
         onStatusChanged?(
             VolumeMemoryStatus(

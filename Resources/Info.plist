@@ -30,6 +30,8 @@
 	<true/>
 	<key>LSMultipleInstancesProhibited</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>查找已配对的耳机、显示它们与 Mac 的连接状态，并在你点击时连回 Mac。</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

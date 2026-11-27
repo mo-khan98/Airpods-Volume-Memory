@@ -1,3 +1,4 @@
+import AudioToolbox
 import CoreAudio
 import Foundation
 
@@ -124,6 +125,27 @@ enum AudioHardware {
         return try device(for: deviceID)
     }
 
+    static func outputDevices() -> [AudioDevice] {
+        objectList(systemObjectID, kAudioHardwarePropertyDevices, globalScope)
+            .filter { !objectList($0, kAudioDevicePropertyStreams, outputScope).isEmpty }
+            .compactMap { try? device(for: $0) }
+    }
+
+    static func setDefaultOutputDevice(_ device: AudioDevice) throws {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: globalScope,
+            mElement: mainElement
+        )
+        var id = device.id
+        let status = AudioObjectSetPropertyData(
+            systemObjectID, &address, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &id
+        )
+        guard status == noErr else {
+            throw AudioDeviceError.osStatus(status, operation: "Set default output device")
+        }
+    }
+
     static func outputMuted(for deviceID: AudioDeviceID) -> Bool {
         for element in [mainElement, AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)] {
             var address = AudioObjectPropertyAddress(
@@ -143,6 +165,11 @@ enum AudioHardware {
     }
 
     static func outputVolume(for deviceID: AudioDeviceID) throws -> Float {
+        if let systemVolume = try? volumeScalar(
+            for: deviceID, element: mainElement, selector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume
+        ) {
+            return systemVolume
+        }
         if let masterVolume = try volumeScalar(for: deviceID, element: mainElement) {
             return masterVolume
         }
@@ -167,6 +194,13 @@ enum AudioHardware {
 
     static func setOutputVolume(_ volume: Float, for deviceID: AudioDeviceID) throws {
         let clampedVolume = min(max(volume, 0), 1)
+
+        if (try? setVolumeScalar(
+            clampedVolume, for: deviceID, element: mainElement,
+            selector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume
+        )) == true {
+            return
+        }
 
         if try setVolumeScalar(clampedVolume, for: deviceID, element: mainElement) {
             return
@@ -306,17 +340,25 @@ enum AudioHardware {
     }
 
     private static func volumeAddresses(for deviceID: AudioDeviceID) -> [AudioObjectPropertyAddress] {
-        [mainElement, AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)]
+        let systemVolume = volumeAddress(
+            element: mainElement, selector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume
+        )
+        let virtualMain = hasProperty(objectID: deviceID, address: systemVolume) ? [systemVolume] : []
+        let channelAddresses = [mainElement, AudioObjectPropertyElement(1), AudioObjectPropertyElement(2)]
             .flatMap { element in
                 [volumeAddress(element: element), AudioObjectPropertyAddress(
                     mSelector: kAudioDevicePropertyMute, mScope: outputScope, mElement: element
                 )]
             }
             .filter { hasProperty(objectID: AudioObjectID(deviceID), address: $0) }
+        return virtualMain + channelAddresses
     }
 
-    private static func volumeScalar(for deviceID: AudioDeviceID, element: AudioObjectPropertyElement) throws -> Float? {
-        var address = volumeAddress(element: element)
+    private static func volumeScalar(
+        for deviceID: AudioDeviceID, element: AudioObjectPropertyElement,
+        selector: AudioObjectPropertySelector = kAudioDevicePropertyVolumeScalar
+    ) throws -> Float? {
+        var address = volumeAddress(element: element, selector: selector)
         guard hasProperty(objectID: AudioObjectID(deviceID), address: address) else {
             return nil
         }
@@ -342,9 +384,10 @@ enum AudioHardware {
     private static func setVolumeScalar(
         _ volume: Float,
         for deviceID: AudioDeviceID,
-        element: AudioObjectPropertyElement
+        element: AudioObjectPropertyElement,
+        selector: AudioObjectPropertySelector = kAudioDevicePropertyVolumeScalar
     ) throws -> Bool {
-        var address = volumeAddress(element: element)
+        var address = volumeAddress(element: element, selector: selector)
         guard hasProperty(objectID: AudioObjectID(deviceID), address: address) else {
             return false
         }
@@ -431,9 +474,12 @@ enum AudioHardware {
         return value
     }
 
-    private static func volumeAddress(element: AudioObjectPropertyElement) -> AudioObjectPropertyAddress {
+    private static func volumeAddress(
+        element: AudioObjectPropertyElement,
+        selector: AudioObjectPropertySelector = kAudioDevicePropertyVolumeScalar
+    ) -> AudioObjectPropertyAddress {
         AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyVolumeScalar,
+            mSelector: selector,
             mScope: outputScope,
             mElement: element
         )
@@ -449,6 +495,8 @@ protocol AudioHardwareControlling {
     func defaultOutputDevice() throws -> AudioDevice?
     func outputVolume(for device: AudioDevice) throws -> Float
     func setOutputVolume(_ volume: Float, for device: AudioDevice) throws
+    func isOutputActive(for device: AudioDevice) -> Bool?
+    func makeOutputActivityListener(for device: AudioDevice, handler: @escaping () -> Void) throws -> AudioPropertyListening
     func makeDefaultOutputDeviceListener(handler: @escaping () -> Void) throws -> AudioPropertyListening
     func makeVolumeListener(for deviceID: AudioDeviceID, handler: @escaping () -> Void) throws -> AudioPropertyListening
 }
@@ -466,6 +514,16 @@ struct SystemAudioHardware: AudioHardwareControlling {
         try AudioHardware.setOutputVolume(volume, for: device)
     }
 
+    func isOutputActive(for device: AudioDevice) -> Bool? {
+        AudioHardware.anyProcessOutputting(on: device.id) ?? AudioHardware.isRunningSomewhere(device.id)
+    }
+
+    func makeOutputActivityListener(
+        for device: AudioDevice, handler: @escaping () -> Void
+    ) throws -> AudioPropertyListening {
+        try AudioHardware.makeRunningListener(for: device.id, handler: handler)
+    }
+
     func makeDefaultOutputDeviceListener(handler: @escaping () -> Void) throws -> AudioPropertyListening {
         try AudioHardware.makeDefaultOutputDeviceListener(handler: handler)
     }
@@ -475,5 +533,67 @@ struct SystemAudioHardware: AudioHardwareControlling {
         handler: @escaping () -> Void
     ) throws -> AudioPropertyListening {
         try AudioHardware.makeVolumeListener(for: deviceID, handler: handler)
+    }
+}
+
+/// Opens an output-only stream for an explicit request to take back the AirPods audio route.
+final class SilentAudioOutput {
+    private let unit: AudioUnit
+
+    init(device: AudioDevice) throws {
+        var description = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        guard let component = AudioComponentFindNext(nil, &description) else {
+            throw AudioDeviceError.missingProperty("HAL output audio unit")
+        }
+        var instance: AudioUnit?
+        try Self.check(AudioComponentInstanceNew(component, &instance), "Create HAL output")
+        guard let instance else { throw AudioDeviceError.missingProperty("HAL output instance") }
+        do {
+            var disabled: UInt32 = 0
+            try Self.check(AudioUnitSetProperty(
+                instance, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1,
+                &disabled, UInt32(MemoryLayout.size(ofValue: disabled))
+            ), "Disable HAL input")
+            var deviceID = device.id
+            try Self.check(AudioUnitSetProperty(
+                instance, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                &deviceID, UInt32(MemoryLayout.size(ofValue: deviceID))
+            ), "Select HAL output")
+            var callback = AURenderCallbackStruct(inputProc: { _, _, _, _, _, buffers in
+                if let buffers {
+                    for buffer in UnsafeMutableAudioBufferListPointer(buffers) {
+                        if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+                    }
+                }
+                return noErr
+            }, inputProcRefCon: nil)
+            try Self.check(AudioUnitSetProperty(
+                instance, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0,
+                &callback, UInt32(MemoryLayout.size(ofValue: callback))
+            ), "Set silent output callback")
+            try Self.check(AudioUnitInitialize(instance), "Initialize HAL output")
+            try Self.check(AudioOutputUnitStart(instance), "Start HAL output")
+        } catch {
+            AudioUnitUninitialize(instance)
+            AudioComponentInstanceDispose(instance)
+            throw error
+        }
+        unit = instance
+    }
+
+    deinit {
+        AudioOutputUnitStop(unit)
+        AudioUnitUninitialize(unit)
+        AudioComponentInstanceDispose(unit)
+    }
+
+    private static func check(_ status: OSStatus, _ operation: String) throws {
+        guard status == noErr else { throw AudioDeviceError.osStatus(status, operation: operation) }
     }
 }

@@ -9,10 +9,13 @@ trap 'rm -rf "$TEST_BUILD_DIR"' EXIT
 
 swiftc \
   -swift-version 5 \
+  -framework IOBluetooth \
   -framework CoreAudio \
   -framework UserNotifications \
   -framework AppKit \
   -o "$TEST_BINARY" \
+  "$ROOT_DIR/Sources/AirpodVolumeMacApp/AirPodsHandoffMonitor.swift" \
+  "$ROOT_DIR/Sources/AirpodVolumeMacApp/AirPodsBluetooth.swift" \
   "$ROOT_DIR/Sources/AirpodVolumeMacApp/AudioDevice.swift" \
   "$ROOT_DIR/Sources/AirpodVolumeMacApp/VolumeMemoryController.swift" \
   "$ROOT_DIR/Sources/AirpodVolumeMacApp/AppPreferences.swift" \
